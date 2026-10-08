@@ -66,7 +66,10 @@ LOGO_FILE_HINT = "ADR-Logo"  # header logo: /wp-content/uploads/2019/11/ADR-Logo
 HEADING_PATTERN = r"how\s+our\s+debt\s+settlement\s+program\s+works"
 # The year is optional. The page HTML has no year (JavaScript adds it), and a hard-coded
 # year would cause a false alarm every January 1.
-FOOTER_PATTERN = r"american\s+debt\s+relief,?\s+llc\s*(?:©|\(c\)|copyright)\s*(?:\d{4}\s*)?all\s+rights\s+reserved"
+FOOTER_PATTERN = r"american\s+debt\s+relief,?\s+llc[\s\S]{0,40}?all\s+rights\s+reserved"
+# Shorter phrases used only to quote "the closest text the monitor found" when a check fails
+HEADING_HINT = r"settlement\s+program"
+FOOTER_HINT = r"rights\s+reserved"
 # Embedded frames that are never "the assessment form" (CAPTCHA boxes, chat widgets, ads, analytics)
 IGNORE_FRAME_HOSTS = ("recaptcha", "hcaptcha", "challenges.cloudflare", "google.com", "doubleclick", "facebook",
                       "livechat", "intercom", "drift", "zendesk", "zopim", "tawk", "hubspot", "youtube",
@@ -121,19 +124,24 @@ LOGO_JS = "([hint, mobile]) => {" + VIS_JS + r"""
     }).slice(0, 8);
 }"""
 
-TEXT_JS = "([pattern]) => {" + VIS_JS + r"""
-  const re = new RegExp(pattern, 'i');
+TEXT_JS = "([pattern, hint]) => {" + VIS_JS + r"""
+  // Hidden code (like a script that writes the year) is invisible to visitors, so ignore it too.
+  // Scripts have already run, so removing them now doesn't change the page.
+  document.querySelectorAll('script, noscript, template').forEach(s => s.remove());
   const norm = s => (s || '').replace(/\s+/g, ' ');
-  const skip = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE']);
-  const hits = [...document.body.querySelectorAll('*')]
-    .filter(el => !skip.has(el.tagName) && re.test(norm(el.textContent)));
-  const leaves = hits.filter(el => ![...el.children].some(c => !skip.has(c.tagName) && re.test(norm(c.textContent))));
-  const out = leaves.map(el => ({
+  const leavesFor = rx => {
+    const hits = [...document.body.querySelectorAll('*')].filter(el => el.tagName !== 'STYLE' && rx.test(norm(el.textContent)));
+    return hits.filter(el => ![...el.children].some(c => rx.test(norm(c.textContent))));
+  };
+  const out = leavesFor(new RegExp(pattern, 'i')).map(el => ({
     tag: el.tagName.toLowerCase(), visible: vis(el),
     stuckAnimation: !!el.closest('.elementor-invisible, .et_animated:not(.et-animated)'),
     text: norm(el.textContent).trim().slice(0, 140),
   }));
-  return { inDom: out.length > 0, ok: out.some(o => o.visible), matches: out.slice(0, 6) };
+  const ok = out.some(o => o.visible);
+  const saw = (!ok && hint) ? leavesFor(new RegExp(hint, 'i'))
+      .map(el => ({ text: norm(el.textContent).trim().slice(0, 140), visible: vis(el) })).slice(0, 3) : [];
+  return { inDom: out.length > 0, ok, matches: out.slice(0, 6), saw };
 }"""
 
 FORM_JS = "() => {" + VIS_JS + r"""
@@ -276,10 +284,10 @@ def check_page(pw, browser, target: str, view: str) -> dict:
                 page.wait_for_timeout(1200)
             except Exception:  # noqa: BLE001
                 pass
-            res["checks"]["heading"] = page.evaluate(TEXT_JS, [HEADING_PATTERN])
+            res["checks"]["heading"] = page.evaluate(TEXT_JS, [HEADING_PATTERN, HEADING_HINT])
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(1500)
-            res["checks"]["footer"] = page.evaluate(TEXT_JS, [FOOTER_PATTERN])
+            res["checks"]["footer"] = page.evaluate(TEXT_JS, [FOOTER_PATTERN, FOOTER_HINT])
 
         elif target == "assessment":
             _scroll_through(page)
@@ -460,10 +468,17 @@ def _diag_view(d: Diagnosis, target: str, view: str, br: dict) -> None:
             d.reason(label, "Logo: a logo is present but not where it belongs in the header.", view)
             d.step("The header layout appears broken or changed. Check the header template and whether CSS files loaded.")
 
+    def _saw(chk):
+        seen = [x for x in chk.get("saw", []) if x.get("text")]
+        if not seen:
+            return ""
+        vis_note = "" if seen[0].get("visible") else " (hidden)"
+        return f' Closest text it found{vis_note}: "{seen[0]["text"]}".'
+
     h = c.get("heading")
     if h and not h.get("ok"):
         if not h.get("inDom"):
-            d.reason(label, 'Heading: "How our debt settlement program works" isn\'t on the page.', view)
+            d.reason(label, 'Heading: "How our debt settlement program works" isn\'t on the page.' + _saw(h), view)
             d.step("Check the homepage's Revisions history in WordPress. The section or its wording may have been edited "
                    "or removed. (If the wording changed on purpose, update HEADING_PATTERN in the monitor.)")
         elif any(m.get("stuckAnimation") for m in h.get("matches", [])):
@@ -476,12 +491,17 @@ def _diag_view(d: Diagnosis, target: str, view: str, br: dict) -> None:
     f = c.get("footer")
     if f and not f.get("ok"):
         if not f.get("inDom"):
-            d.reason(label, "Footer: the copyright line is missing. The page may be cut off partway through.", view)
+            d.reason(label, "Footer: the copyright line is missing. The page may be cut off partway through." + _saw(f), view)
             d.step("A PHP error partway through the page often cuts it off. Check the PHP error log and recent footer/plugin "
                    "changes. (If the footer wording changed on purpose, update FOOTER_PATTERN in the monitor.)")
         else:
             d.reason(label, "Footer: the copyright line exists but is hidden.", view)
             d.step("Check the footer template's responsive visibility settings and whether CSS files loaded.")
+
+    for chk in (h, f):
+        if chk and not chk.get("ok") and any(x.get("visible") for x in chk.get("saw", [])):
+            d.step("Compare the 'closest text it found' above with the live site. If it looks right, this is a false "
+                   "alarm from changed wording; update the matching pattern near the top of monitor_adr.py.", first=True)
 
     form = c.get("form")
     if form and not form.get("ok"):
