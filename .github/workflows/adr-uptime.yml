@@ -1,0 +1,72 @@
+name: ADR website uptime monitor
+
+on:
+  schedule:
+    - cron: "3,18,33,48 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Send a TEST message to Teams instead of checking the site"
+        type: choice
+        options: [none, down, recovery]
+        default: none
+
+permissions:
+  contents: write
+
+concurrency:
+  group: adr-uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Check americandebtrelief.com (desktop + mobile)
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        run: |
+          if [ "${{ inputs.test_alert }}" = "down" ] || [ "${{ inputs.test_alert }}" = "recovery" ]; then
+            python monitor_adr.py --test-alert "${{ inputs.test_alert }}"
+          else
+            python monitor_adr.py
+          fi
+
+      - name: Save up/down status (and keep the schedule alive)
+        if: always()
+        run: |
+          git config user.name  "adr-uptime-monitor"
+          git config user.email "adr-uptime-monitor@users.noreply.github.com"
+          last=$(git log -1 --format=%ct); now=$(date +%s)
+          if [ $(( (now - last) / 86400 )) -ge 45 ]; then
+            mkdir -p state && date -u +"%Y-%m-%dT%H:%M:%SZ" > state/heartbeat.txt
+          fi
+          git add state/ 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No status change to save."
+          else
+            git commit -m "Monitor status update [skip ci]"
+            for i in 1 2 3; do git pull --rebase --quiet && git push --quiet && break; sleep 5; done
+          fi
+
+      - name: Save screenshots of what the monitor saw (failures only)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: adr-screenshots
+          path: screenshots/
+          if-no-files-found: ignore
+          retention-days: 14
