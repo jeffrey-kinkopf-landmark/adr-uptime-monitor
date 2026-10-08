@@ -1,6 +1,4 @@
 {
-  "status": "down",
-  "since": "2026-10-08T11:49:02.311097-05:00",
-  "headline": "Mobile looks fine, but the DESKTOP version is broken.",
-  "last_alert": "2026-10-08T11:49:02.311097-05:00"
+  "status": "up",
+  "since": "2026-10-08T12:19:09.171275-05:00"
 }
